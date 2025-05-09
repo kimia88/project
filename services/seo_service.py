@@ -1,83 +1,164 @@
 import logging
-import requests
+import json
+import re
+from datetime import datetime
+import time
+import os
 
 class SEOService:
-    def __init__(self, db, q_service):
+    def __init__(self, db, q_service, min_seo_score=5, max_retries=3, retry_delay=5):
         self.db = db
         self.q_service = q_service
-
-    def generate_title_only(self, content_id, lang_id):
-        try:
-            # گرفتن توضیح برای محتوای مورد نظر
-            query = "SELECT Description FROM dbo.TblPureContent WHERE Id = ?"
-            result = self.db.select(query, [content_id])
-            if not result:
-                raise ValueError(f"❌ توضیحی برای محتوا با ID {content_id} پیدا نشد.")
-            
-            description = result[0][0]
-            prompt = f"Generate a compelling and SEO-optimized title for the following content (LangId={lang_id}):\n\n{description}"
-            
-            title = self.qwen_generate(prompt)
-            return title or "عنوان پیش‌فرض"
-        except Exception as e:
-            logging.error(f"❌ خطا در generate_title_only برای content_id={content_id}: {e}")
-            return "عنوان پیش‌فرض"
+        self.min_seo_score = min_seo_score
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay  # زمان تاخیر بین تلاش‌ها
 
     def generate_title_for_all(self):
+        """Extracts all content and attempts to optimize titles based on SEO score."""
         try:
-            all_content = self.db.get_all_purecontents()  # گرفتن تمام محتواها
-            if not all_content:
-                logging.info("✅ محتوایی برای تولید عنوان پیدا نشد.")
+            contents = self.db.get_all_purecontents()
+            if not contents:
+                logging.info("✅ محتوایی برای پردازش وجود ندارد.")
                 return
 
-            for content in all_content:
-                content_id = content[0]  # Id محتوا
-                lang_id = content[4]  # زبان محتوا
-                current_title = content[1]  # عنوان موجود
-                
-                if current_title and current_title.strip():
-                    logging.info(f"ℹ️ محتوا {content_id} عنوان دارد. بهینه‌سازی عنوان...")
-                    generated_title = self.optimize_title_for_seo(current_title)
-                else:
-                    logging.info(f"ℹ️ محتوا {content_id} عنوان ندارد. تولید عنوان جدید...")
-                    generated_title = self.generate_title_only(content_id, lang_id)
-                
-                logging.info(f"✅ عنوان نهایی برای ID {content_id}: {generated_title}")
+            output = []
+            for content_id, title, *_rest, lang_id in contents:
+                if not title or not title.strip():
+                    logging.warning(f"⚠️ محتوا {content_id} عنوان ندارد.")
+                    continue
 
-                # ذخیره عنوان جدید در دیتابیس
-                self.db.update_pure_content(content_id, generated_title)
+                logging.info(f"ℹ️ بهینه‌سازی عنوان محتوا {content_id} شروع شد...")
 
-        except Exception as e:
-            logging.error(f"⚠️ خطا در generate_title_for_all: {e}")
+                try:
+                    new_title, score, raw = self.optimize_title_until_score_ok(title, lang_id)
+                    output.append({
+                        "content_id": content_id,
+                        "old_title": title,
+                        "new_title": new_title,
+                        "seo_score": score,
+                        "raw_response": raw
+                    })
+                    logging.info(f"✅ عنوان نهایی {content_id}: {new_title} (SEO: {score})")
+                except Exception:
+                    logging.exception(f"❌ خطا در پردازش {content_id}")
 
-    def optimize_title_for_seo(self, title):
-        optimized_title = title.strip()
-        if len(optimized_title) < 60:
-            optimized_title += " | بهترین انتخاب برای SEO"
-        return optimized_title
+            self._save_output_file(output)
+
+        except Exception:
+            logging.exception("❌ خطای کلی در generate_title_for_all")
+
+    def optimize_title_until_score_ok(self, title, lang_id):
+        """Try optimizing the title up to max_retries until SEO score is sufficient using Qwen."""
+        for attempt in range(1, self.max_retries + 1):
+            raw, new_title, score = self.qwen_optimize_title_and_score(title, lang_id)
+            logging.info(f"📝 تلاش {attempt}: {new_title} (SEO: {score})")
+
+            if score >= self.min_seo_score:
+                logging.info(f"✅ امتیاز سئو مطلوب بدست آمد: {score}")
+                return new_title, score, raw
+            else:
+                logging.debug(f"⏳ امتیاز کافی نبود (SEO: {score}), ادامه تلاش...")
+
+            # Delay between retries to avoid overwhelming the service
+            time.sleep(self.retry_delay)  # استفاده از time.sleep
+
+        logging.error(f"❌ به امتیاز سئو مطلوب نرسید. آخرین امتیاز: {score} برای عنوان: {new_title}")
+        return new_title, score, raw
+
+    def qwen_optimize_title_and_score(self, title, lang_id):
+        """Send title to Qwen model and evaluate response."""
+        prompt = f"{self._get_prompt_by_lang(lang_id)}\n\n{title}"
+        try:
+            response = self.qwen_generate(prompt)
+            optimized = self.extract_clean_title(response) or title
+            score = self.calculate_seo_score(optimized)
+            return response, optimized, score
+        except Exception:
+            logging.exception("❌ خطا در qwen_optimize_title_and_score")
+            return "", title, 0
 
     def qwen_generate(self, prompt):
+        """Send request to Qwen and return response."""
         try:
-            response = self.q_service.send_request(prompt)
+            self.q_service.send_request(prompt)
+            result = self.q_service.get_response()
+            if not result or "متاسفانه" in result:
+                raise ValueError("مدل پاسخ مناسبی نداد.")
+            return result.strip()
+        except Exception:
+            logging.exception("⚠️ خطا در qwen_generate")
+            return ""
 
-            if not response:
-                raise ValueError("پاسخی از مدل دریافت نشد.")
+    def extract_clean_title(self, response):
+        """Try extracting a clean title line from the model's response."""
+        for line in response.splitlines():
+            cleaned = re.sub(r"[*#“”\"]", "", line).strip()
+            if 10 < len(cleaned) < 120 and ":" not in cleaned:
+                return cleaned
+        return None
 
-            if isinstance(response, dict):
-                new_title = response.get("result", "").strip()
-                if not new_title:
-                    raise ValueError("مدل عنوانی تولید نکرد.")
-                return new_title
-            else:
-                raise ValueError("فرمت پاسخ مدل قابل استفاده نیست.")
+    def calculate_seo_score(self, title):
+        """Evaluate the SEO score of a given title."""
+        score, length, words = 0, len(title), title.split()
+        wc = len(words)
 
-        except ValueError as e:
-            logging.error(f"⚠️ خطای مقداردهی: {e}")
-        except requests.exceptions.Timeout:
-            logging.error("⚠️ درخواست به Qwen تایم‌اوت شد.")
-        except requests.exceptions.RequestException as e:
-            logging.error(f"⚠️ خطای شبکه: {e}")
-        except Exception as e:
-            logging.error(f"⚠️ خطای کلی در qwen_generate: {e}")
+        # بررسی طول عنوان
+        if 60 <= length <= 80:
+            score += 3
+        elif 50 <= length <= 90:
+            score += 2
+        elif 30 <= length <= 100:
+            score += 1
+        else:
+            score -= 2
+            logging.debug(f"🔴 طول نامناسب: {length} کاراکتر.")
 
-        return ""
+        # بررسی تعداد کلمات
+        if 4 <= wc <= 9:
+            score += 1
+        elif wc < 3 or wc > 12:
+            score -= 1
+            logging.debug(f"🔴 تعداد کلمات نامناسب: {wc} کلمه.")
+
+        # بررسی وجود عدد
+        if re.search(r"\b\d+\b", title):
+            score += 1
+
+        # میانگین طول کلمات
+        if wc and (sum(len(w) for w in words) / wc) < 6:
+            score += 1
+
+        # کلمات کلیدی
+        keywords = ["SEO", "optimize", "rank", "guide", "boost", "traffic", "title", "headline"]
+        if any(kw.lower() in title.lower() for kw in keywords):
+            score += 2
+
+        # عنوان سوالی
+        if "?" in title or any(q in title.lower() for q in ["why", "how", "what"]):
+            score += 2
+
+        logging.debug(f"📊 SEO Score: {score} برای عنوان: {title}")
+        return score
+
+    def _get_prompt_by_lang(self, lang_id):
+        """Return language-specific prompt.""" 
+        return {
+            1: "این عنوان را برای سئو بهینه کن. کوتاه، جذاب، حاوی عدد و قابل کلیک باشد:",
+            2: "Please rewrite the following title to make it more SEO-friendly and engaging.\nGuidelines:\n- Length: 60–80 characters\n- Use a number if possible\n- Use strong power words\n- Be clear and click-worthy\n- Output only the optimized title.\n\nOriginal title:",
+            3: "حسّن هذا العنوان لمحركات البحث مع الحفاظ على جاذبيته ووضوحه:",
+            4: "Bu başlığı SEO için optimize edin. Kısa, dikkat çekici ve açık olsun:",
+            5: "Optimisez ce titre pour le SEO. Soyez accrocheur, clair et concis :",
+        }.get(lang_id, "")
+
+    def _save_output_file(self, data):
+        """Save results to timestamped JSON file."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = "seo_output"
+        os.makedirs(output_dir, exist_ok=True)
+        path = f"{output_dir}/seo_titles_output_{ts}.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+            logging.info(f"📁 فایل خروجی ذخیره شد: {path}")
+        except Exception:
+            logging.exception("❌ خطا در ذخیره فایل خروجی:")
